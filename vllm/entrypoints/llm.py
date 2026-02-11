@@ -1596,6 +1596,9 @@ class LLM:
         outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
         total_in_toks = 0
         total_out_toks = 0
+
+        # NOTE AUTOMTP: spec_decoding_info is now accumulated in RequestState
+        # No need to manually accumulate here
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:

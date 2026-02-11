@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass, field
 from typing import Optional
+import json
+import os
 
 import torch
 import torch.nn as nn
@@ -18,6 +21,53 @@ GREEDY_TEMPERATURE: tl.constexpr = -1
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+@dataclass
+class DroppedTokenInfo:
+    """Information about a dropped draft token."""
+    draft_token_id: int
+    correct_token_id: int
+    draft_prob_on_eagle3: float  # P(draft_token | eagle3 model)
+    correct_prob_on_eagle3: float  # P(correct_token | eagle3 model)
+    draft_prob_on_base: float  # P(draft_token | base model)
+    correct_prob_on_base: float  # P(correct_token | base model)
+    position: int  # Position in the draft sequence
+
+
+@dataclass
+class DroppedTokensStore:
+    """Global store for dropped token information."""
+    records: list = field(default_factory=list)
+    save_path: str = "/apdcephfs_fsgm/share_303846923/user/zackszcwang/mtp-swift/dropped_tokens.jsonl"
+    
+    def add_record(self, info: DroppedTokenInfo):
+        self.records.append({
+            "draft_token_id": info.draft_token_id,
+            "correct_token_id": info.correct_token_id,
+            "draft_prob_on_eagle3": info.draft_prob_on_eagle3,
+            "correct_prob_on_eagle3": info.correct_prob_on_eagle3,
+            "draft_prob_on_base": info.draft_prob_on_base,
+            "correct_prob_on_base": info.correct_prob_on_base,
+            "position": info.position,
+        })
+    
+    def save_to_file(self):
+        """Save records to file and clear the buffer."""
+        if not self.records:
+            return
+        with open(self.save_path, "a") as f:
+            for record in self.records:
+                f.write(json.dumps(record) + "\n")
+        self.records.clear()
+    
+    def clear(self):
+        self.records.clear()
+    
+    def get_records(self):
+        return self.records.copy()
+
+
 
 
 class RejectionSampler(nn.Module):
@@ -91,6 +141,8 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+        # if draft_probs is not None:
+        #     draft_probs = draft_probs.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
@@ -131,7 +183,6 @@ class RejectionSampler(nn.Module):
         ]
         return outputs
 
-
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -171,6 +222,17 @@ def rejection_sample(
     )
     output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)
 
+    # # NOTE: 跳过验证，直接接受所有draft tokens
+    # # Accept all draft tokens without verification
+    # accept_all_draft_tokens_kernel[(batch_size, )](
+    #     output_token_ids,
+    #     cu_num_draft_tokens,
+    #     draft_token_ids,
+    #     bonus_token_ids,
+    #     max_spec_len,
+    # )
+    # return output_token_ids, None
+
     if sampling_metadata.all_greedy:
         is_greedy = None
     else:
@@ -189,19 +251,31 @@ def rejection_sample(
             num_warps=1,
         )
         if sampling_metadata.all_greedy:
-            return output_token_ids
-
+            # Record dropped tokens information for greedy sampling
+            # Note: when all_greedy=True, target_probs is actually logits
+            if draft_probs is not None:
+                prob_output = _record_dropped_tokens(
+                    draft_token_ids=draft_token_ids,
+                    output_token_ids=output_token_ids,
+                    num_draft_tokens=num_draft_tokens,
+                    cu_num_draft_tokens=cu_num_draft_tokens,
+                    draft_probs=draft_probs,
+                    target_probs=target_probs,
+                    max_spec_len=max_spec_len,
+                    is_target_logits=True,  # target_probs is logits when all_greedy
+                )
+                return output_token_ids, prob_output
+            else:
+                return output_token_ids, None
     # Generate uniform probabilities for rejection sampling.
-    # [num_tokens]
     uniform_probs = generate_uniform_probs(
         num_tokens,
         num_draft_tokens,
         sampling_metadata.generators,
         device,
     )
-
+    
     # Sample recovered tokens for each position.
-    # [num_tokens]
     recovered_token_ids = sample_recovered_tokens(
         max_spec_len,
         num_draft_tokens,
@@ -212,7 +286,7 @@ def rejection_sample(
         sampling_metadata,
         device,
     )
-
+    
     # Rejection sampling for random sampling requests.
     rejection_random_sample_kernel[(batch_size, )](
         output_token_ids,
@@ -229,8 +303,97 @@ def rejection_sample(
         NO_DRAFT_PROBS=draft_probs is None,
         num_warps=1,
     )
-    return output_token_ids
+    
+    if draft_probs is not None:
+        # Record dropped tokens information
+        prob_output = _record_dropped_tokens(
+            draft_token_ids=draft_token_ids,
+            output_token_ids=output_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            draft_probs=draft_probs,
+            target_probs=target_probs,
+            max_spec_len=max_spec_len,
+        )
+    
+    # print(f'Debug Helper | output token ids.shape: {output_token_ids.shape}')
+    # assert False
+        return output_token_ids, prob_output
+    else:
+        return output_token_ids, None
 
+
+def _record_dropped_tokens(
+    draft_token_ids: torch.Tensor,  # [num_tokens]
+    output_token_ids: torch.Tensor,  # [batch_size, max_spec_len + 1]
+    num_draft_tokens: list[int],
+    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
+    draft_probs: Optional[torch.Tensor],  # [num_tokens, vocab_size]
+    target_probs: torch.Tensor,  # [num_tokens, vocab_size] - may be logits or probs
+    max_spec_len: int,
+    is_target_logits: bool = False,  # True if target_probs is actually logits
+) -> None:
+    """
+    Record information about dropped (rejected) draft tokens.
+    
+    For each dropped token, we record:
+    1. The draft token id and the correct (accepted) token id
+    2. Probabilities of both tokens on the eagle3 (draft) model
+    3. Probabilities of both tokens on the base (target) model
+    """
+    
+    # Convert target logits to probs if needed
+    if is_target_logits:
+        target_probs = target_probs.softmax(dim=-1, dtype=torch.float32)
+    
+    # Move tensors to CPU for easier processing
+    draft_token_ids_cpu = draft_token_ids.cpu()
+    output_token_ids_cpu = output_token_ids.cpu()
+    cu_num_draft_tokens_cpu = cu_num_draft_tokens.cpu()
+    
+    outputs = {'draft_token_id': [], 'correct_token_id': [], 'draft_prob_on_eagle3': [], 'correct_prob_on_eagle3': [], 'draft_prob_on_base': [], 'correct_prob_on_base': []}
+    # Process each request in the batch
+    for req_idx in range(len(num_draft_tokens)):
+        if req_idx == 0:
+            start_idx = 0
+        else:
+            start_idx = cu_num_draft_tokens_cpu[req_idx - 1].item()
+        end_idx = cu_num_draft_tokens_cpu[req_idx].item()
+        n_draft = num_draft_tokens[req_idx]
+        
+        if n_draft == 0:
+            continue
+        
+        # Get the output tokens for this request (excluding bonus token)
+        output_for_req = output_token_ids_cpu[req_idx, :n_draft]
+        
+        # Compare draft tokens with output tokens to find rejected ones
+        for pos in range(n_draft):
+            draft_token_id = draft_token_ids_cpu[start_idx + pos].item()
+            output_token_id = output_for_req[pos].item()
+            
+            # Check if token was rejected (draft != output)
+            if draft_token_id != output_token_id and output_token_id != PLACEHOLDER_TOKEN_ID:
+                correct_token_id = output_token_id
+                token_idx = start_idx + pos
+                
+                # Get probabilities from target model (base model)
+                draft_prob_on_base = target_probs[token_idx, draft_token_id].item()
+                correct_prob_on_base = target_probs[token_idx, correct_token_id].item()
+                
+                # Get probabilities from draft model (eagle3)
+                assert draft_probs is not None
+                draft_prob_on_eagle3 = draft_probs[token_idx, draft_token_id].item()
+                correct_prob_on_eagle3 = draft_probs[token_idx, correct_token_id].item()
+
+                outputs['draft_prob_on_eagle3'].append(round(draft_prob_on_eagle3, 2))
+                outputs['correct_prob_on_eagle3'].append(round(correct_prob_on_eagle3, 2))
+                outputs['draft_prob_on_base'].append(round(draft_prob_on_base, 2))
+                outputs['correct_prob_on_base'].append(round(correct_prob_on_base, 2))
+                outputs['draft_token_id'].append(draft_token_id)
+                outputs['correct_token_id'].append(correct_token_id)
+
+    return outputs
 
 def compute_probs(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
@@ -431,6 +594,37 @@ def sample_recovered_tokens(
         NO_DRAFT_PROBS=draft_probs is None,
     )
     return recovered_token_ids
+
+
+@triton.jit(do_not_specialize=["max_spec_len"])
+def accept_all_draft_tokens_kernel(
+    output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    draft_token_ids_ptr,  # [num_tokens]
+    bonus_token_ids_ptr,  # [batch_size]
+    max_spec_len,
+):
+    """directly accept all draft tokens, without verification"""
+    req_idx = tl.program_id(0)
+
+    if req_idx == 0:
+        start_idx = 0
+    else:
+        start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    num_draft_tokens = end_idx - start_idx
+
+    # 直接复制所有draft tokens到输出
+    for pos in range(num_draft_tokens):
+        draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+        tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                 draft_token_id)
+
+    # 追加bonus token
+    bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+    tl.store(
+        output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
+        bonus_token_id)
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.

@@ -5,6 +5,7 @@ from collections.abc import MutableSequence
 from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass
 from typing import Any, Generic, Optional, Union
+from dataclasses import dataclass, field
 
 import torch
 from typing_extensions import TypeVar
@@ -45,6 +46,9 @@ class CompletionOutput:
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
+
+    # NOTE AUTOMTP: Commented out - keep field for compatibility
+    spec_decoding_info: list[dict[str, Any]] = field(default_factory=list)
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -98,6 +102,12 @@ class RequestOutput:
                                   None if decoder-only.
         num_cached_tokens: The number of tokens with prefix cache hit.
         kv_transfer_params: The params for remote K/V transfer.
+        mtp_predictions: Accumulated list of all MTP predictions for this request.
+                         Each prediction is a dict with:
+                         - 'mtp_start_idx': token position where MTP starts (the next token position)
+                         - 'source_idx': token position used to predict mtp_start_idx (mtp_start_idx - 1)
+                         - 'mtp_size': predicted MTP step size
+        dropped_token_probs: Accumulated dropped token probability info (merged dict with all keys extended).
     """
 
     def __init__(
@@ -116,6 +126,8 @@ class RequestOutput:
         *,
         multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None,
         kv_transfer_params: Optional[dict[str, Any]] = None,
+        mtp_predictions: Optional[list] = None,
+        dropped_token_probs: Optional[dict] = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -136,12 +148,20 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.mtp_predictions = mtp_predictions
+        self.dropped_token_probs = dropped_token_probs
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        
+        # Update MTP predictions with accumulated history
+        # Since mtp_predictions contains accumulated history, we use the latest one
+        # which already includes all previous predictions
+        if next_output.mtp_predictions is not None:
+            self.mtp_predictions = next_output.mtp_predictions
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -161,6 +181,10 @@ class RequestOutput:
                             next_completion.cumulative_logprob)
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        # NOTE AUTOMTP: Commented out - Merge spec_decoding_info
+                        # if next_completion.spec_decoding_info:
+                        #     completion.spec_decoding_info.extend(
+                        #         next_completion.spec_decoding_info)
                     else:
                         # Replace the output with the new one
                         self.outputs[i] = next_completion

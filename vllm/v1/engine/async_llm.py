@@ -433,6 +433,9 @@ class AsyncLLM(EngineClient):
         logger_manager = self.logger_manager
 
         async def output_handler():
+            # NOTE AUTOMTP
+            # NOTE AUTOMTP: Commented out
+            # spec_decoding_info: dict[str, list[dict[str, Any]]] = {}
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
@@ -453,6 +456,18 @@ class AsyncLLM(EngineClient):
                             cdiv(num_outputs, VLLM_V1_OUTPUT_PROC_CHUNK_SIZE))
 
                     for i, outputs_slice in enumerate(slices):
+                        # NOTE AUTOMTP: Commented out
+                        # for engine_core_output in outputs_slice:
+                        #     from vllm.v1.engine import EngineCoreOutput
+                        #     engine_core_output: EngineCoreOutput
+                        #     if engine_core_output.request_id not in spec_decoding_info:
+                        #         spec_decoding_info[engine_core_output.request_id] = []
+                        #     spec_decoding_info[engine_core_output.request_id].extend(
+                        #         engine_core_output.spec_decoding_info
+                        #     )
+                        #     engine_core_output.spec_decoding_info = spec_decoding_info[engine_core_output.request_id]
+                        #     # print(f"HELPER_LOG | async_llm | engine_core_output.spec_decoding_info: {len(engine_core_output.spec_decoding_info)}")
+
                         # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
                             outputs_slice, outputs.timestamp, iteration_stats)

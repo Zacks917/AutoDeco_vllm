@@ -3,7 +3,7 @@
 
 from collections.abc import Iterable
 from typing import Optional
-
+from pydantic_core.core_schema import NoneSchema
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
@@ -22,6 +22,7 @@ from vllm.model_executor.models.llama import (LlamaDecoderLayer,
 
 from .utils import AutoWeightsLoader, maybe_prefix
 
+from .adapter import AutoMTPStopHeadV4, AutoMTPStopHeadMid, AutoMTPStopHeadSimple, AutoMTPStopHeadDeep
 logger = init_logger(__name__)
 
 
@@ -82,6 +83,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             hidden_states=hidden_states)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -227,6 +229,14 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             requires_grad=False,
         )
 
+        self.adapter = AutoMTPStopHead(
+            hidden_size=self.config.hidden_size,
+        )
+        # 先创建原始 adapter，等权重加载后再 compile
+        # self.adapter = AutoMTPStopHeadSimple(hidden_size=self.config.hidden_size)
+        self._adapter_compiled = False  # 标记是否已 compile
+        # self.adapter = AutoMTPStopHeadDeep(hidden_size=self.config.hidden_size)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -239,6 +249,33 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
                 f"{type(self).__name__} does not support multimodal inputs yet."
             )
         return self.model(input_ids, positions, hidden_states)
+
+    # @torch.inference_mode()  
+    def should_stop(
+        self,
+        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.adapter is None:
+            if hidden_states.dim() == 1:
+                return torch.tensor(False, device=hidden_states.device)
+            return torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
+
+        # Compute entropy using torch.special.entr (更高效的 CUDA 实现)
+        # entr(p) = -p * log(p)，所以 entropy = sum(entr(p))
+        probs = torch.nn.functional.softmax(logits.float(), dim=-1)
+        entropy = torch.special.entr(probs).sum(dim=-1, keepdim=True)  # [num_tokens, 1]
+        entropy = entropy.to(hidden_states.dtype)
+        
+        # [num_tokens, hidden_size] + [num_tokens, 1] → [num_tokens, hidden_size + 1]
+        hidden_states = torch.cat([hidden_states, entropy], dim=-1)
+
+        stop_logits = self.adapter(hidden_states)  # [num_tokens, 1] 或 [1]
+        stop_prob = torch.sigmoid(stop_logits).squeeze(-1)
+        
+        print(f"Debug Helper | stop_prob: {stop_prob}")
+        # 返回布尔 tensor: [num_tokens] 或标量
+        return True if stop_prob >= 0.5 else False
 
     def compute_logits(
         self,
@@ -271,18 +308,25 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
+        includes_adapter = False
         for name, loaded_weight in weights:
             if "t2d" in name:
                 continue
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
-            elif "lm_head" not in name:
+            if 'draft_id_to_target_id' in name:
+                includes_draft_id_mapping = True
+            elif "lm_head" not in name and "adapter" not in name: # NOTE: AUTOMTP
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
+            if 'adapter' in name:
+                includes_adapter = True
             model_weights[name] = loaded_weight
-
+        
+        if not includes_adapter:
+            self.adapter = None
         skip_substrs = []
         if not includes_draft_id_mapping:
             skip_substrs.append("draft_id_to_target_id")
@@ -294,3 +338,25 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
+        
+        # 权重加载完成后，compile adapter 以加速推理
+        if self.adapter is not None and not self._adapter_compiled:
+            self.adapter = torch.compile(
+                self.adapter,
+                mode="reduce-overhead",  # 减少运行时开销，适合小模型
+                fullgraph=True,  # 强制编译整个图，避免 graph breaks
+            )
+            self._adapter_compiled = True
+            
+            # 预热编译：预热多个常见 batch size，避免运行时重新编译
+            device = next(self.adapter.parameters()).device
+            dtype = next(self.adapter.parameters()).dtype
+            warmup_batch_sizes = [1, 2, 4, 8]  # 常见的 batch sizes
+            with torch.inference_mode():
+                for bs in warmup_batch_sizes:
+                    dummy_input = torch.randn(
+                        bs, self.config.hidden_size + 1, 
+                        device=device, dtype=dtype
+                    )
+                    _ = self.adapter(dummy_input)
+            logger.info(f"Adapter compiled and warmed up for batch sizes {warmup_batch_sizes}")

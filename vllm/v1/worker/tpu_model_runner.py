@@ -1120,6 +1120,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
+            spec_decoding_info={},
             kv_connector_output=kv_connector_output,
         )
 

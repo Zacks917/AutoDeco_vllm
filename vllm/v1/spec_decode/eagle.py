@@ -29,6 +29,8 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import (apply_top_k_top_p,
+                                                  random_sample)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -152,6 +154,63 @@ class EagleProposer:
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
 
+        # Sampling epsilon for temperature check
+        self._SAMPLING_EPS = 1e-5
+
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Sample tokens from logits using the same sampling logic as the main model.
+        
+        Args:
+            logits: [batch_size, vocab_size] tensor of logits
+            sampling_metadata: Sampling metadata containing temperature, top_k, top_p, etc.
+            return_probs: If True, also return the probability distribution.
+            
+        Returns:
+            Tuple of (sampled_tokens, probs). probs is None if return_probs is False.
+        """
+        # Handle greedy sampling (all_greedy flag)
+        if sampling_metadata.all_greedy:
+            sampled = logits.argmax(dim=-1)
+            return sampled
+        
+        # Convert logits to float32 for sampling
+        logits = logits.to(torch.float32)
+        
+        # Check if we should use greedy sampling based on temperature
+        use_greedy = False
+        if sampling_metadata.temperature is not None:
+            # If temperature is very low, use greedy sampling
+            use_greedy = (sampling_metadata.temperature < self._SAMPLING_EPS).all()
+            if use_greedy:
+                sampled = logits.argmax(dim=-1)
+                return sampled
+        
+        # Apply temperature
+        if sampling_metadata.temperature is not None:
+            # Avoid division by zero for greedy requests
+            temp = sampling_metadata.temperature
+            if not sampling_metadata.all_random:
+                temp = torch.where(temp < self._SAMPLING_EPS, 1.0, temp)
+            logits = logits.div_(temp.unsqueeze(dim=1))
+        
+        # Apply top-k and top-p filtering
+        logits = apply_top_k_top_p(
+            logits,
+            sampling_metadata.top_k,
+            sampling_metadata.top_p,
+        )
+        
+        # Convert to probabilities and sample
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        sampled = random_sample(probs, sampling_metadata.generators)
+        
+        return sampled
+
     def propose(
         self,
         # [num_tokens]
@@ -166,24 +225,44 @@ class EagleProposer:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         mm_embeds: Optional[list[torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        num_tokens = target_token_ids.shape[0]
-        batch_size = next_token_ids.shape[0]
+        # [batch_size] - dynamic MTP step size prediction (Auto-MTP)
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Returns:
+            draft_token_ids: [batch_size, num_speculative_tokens]
+            draft_probs: [num_draft_tokens, vocab_size] or None
+                where num_draft_tokens = batch_size * num_speculative_tokens
+        """
+        num_tokens = target_token_ids.shape[0] # flatten tensor，all tokens in the batch are concatenated
+        batch_size = next_token_ids.shape[0] # request num
+
 
         if last_token_indices is None:
-            last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
+            last_token_indices = common_attn_metadata.query_start_loc[1:] - 1 # end token idx of each request
 
         if self.method == "eagle3":
             assert isinstance(self.model, Eagle3LlamaForCausalLM)
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
+
+        # last_h = target_hidden_states[last_token_indices]
+        # mtp_size = self.model.compute_mtp_size(last_h)
+        # if mtp_size is not None:
+        #     max_mtp_size = int(mtp_size.item())
+        #     # Cap at num_speculative_tokens, ensure at least 1
+        #     effective_num_spec_tokens = max_mtp_size
+        # else:
+        #     effective_num_spec_tokens = self.num_speculative_tokens
+
         # Shift the input ids by one token.
         # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
+        # print(f'Debug Helper | self.input_ids: {self.input_ids}')
         self.input_ids[:num_tokens - 1] = target_token_ids[1:]
         # Replace the last token with the next token.
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
         self.input_ids[last_token_indices] = next_token_ids
+        # print(f'Debug Helper | self.input_ids after shift: {self.input_ids}')
 
         assert self.runner is not None
 
@@ -217,8 +296,9 @@ class EagleProposer:
         else:
             num_input_tokens = num_tokens
         # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions
-        self.hidden_states[:num_tokens] = target_hidden_states
+        self.positions[:num_tokens] = target_positions # TODO: print to check
+        # print(f'Debug Helper | self.positions: {self.positions}')
+        self.hidden_states[:num_tokens] = target_hidden_states # multiple tokens' hidden states
         if self.is_multimodal_model:
             input_ids = self.input_ids[:num_tokens]
             inputs_embeds = self.model.get_input_embeddings(
@@ -246,13 +326,31 @@ class EagleProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+
         sample_hidden_states = last_hidden_states[last_token_indices]
+        
+        # # NOTE: AUTOMTP
         logits = self.model.compute_logits(sample_hidden_states)
 
-        # Early exit if there is only one draft token to be generated.
+        # NOTE: AUTOMTP
+        # should_stop = None
+
         if self.num_speculative_tokens == 1:
+            # greedy 
             draft_token_ids = logits.argmax(dim=-1)
-            return draft_token_ids.view(-1, 1)
+
+            # sampling
+            # draft_token_ids = self._sample_from_logits(
+            #     logits, sampling_metadata)
+            # print(f'Debug Helper | sampling_metadata: {sampling_metadata}')
+            # assert False
+
+            should_stop = self.model.should_stop(sample_hidden_states, logits)
+            
+            if should_stop:
+                # print(f'Debug Helper | should_stop is True')
+                return None, logits
+            return draft_token_ids.view(-1, 1), logits
 
         positions = target_positions[last_token_indices]
         if self.method in ("deepseek_mtp", "ernie_mtp", "longcat_flash_mtp"):
@@ -270,9 +368,27 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
-            return torch.cat(draft_token_ids_list, dim=1)
+            # NOTE: Tree attention does not return draft_probs for now
+            return torch.cat(draft_token_ids_list, dim=1), None
 
+        should_stop = self.model.should_stop(sample_hidden_states, logits)
+        if should_stop:
+            return None, logits
+
+        # greedy
         draft_token_ids = logits.argmax(dim=-1)
+
+        # sampling
+        # draft_token_ids = self._sample_from_logits(
+        #     logits, sampling_metadata)
+        # stop_hidden_states = [sample_hidden_states]
+        # draft_logits_list = [logits]
+
+
+
+        # draft_token_ids, first_probs = self._sample_from_logits(
+        #     logits, sampling_metadata, return_probs=True)
+        # draft_probs_list = [first_probs] if first_probs is not None else []
 
         if self.allowed_attn_types is not None and \
             not isinstance(attn_metadata, self.allowed_attn_types):
@@ -290,6 +406,7 @@ class EagleProposer:
             input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
         else:
             input_batch_size = batch_size
+
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -376,13 +493,67 @@ class EagleProposer:
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
+
+
+
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
+            # draft_token_ids = logits.argmax(dim=-1)
+            # Use sampling instead of argmax
+            # draft_token_ids, step_probs = self._sample_from_logits(
+            #     logits, sampling_metadata, return_probs=True)
+
+
+            # NOTE: AUTOMTP
+            # stop_hidden_states = torch.roll(stop_hidden_states, -1, dims=0)
+            # stop_hidden_states[-1] = last_hidden_states[:batch_size]
+            # stop_hidden_states.append(last_hidden_states[:batch_size])
+            # draft_logits_list.append(logits)
+            
+            should_stop = self.model.should_stop(last_hidden_states[:batch_size], logits)
+            
+            if should_stop:
+                break
+            # greedy
             draft_token_ids = logits.argmax(dim=-1)
+            # sampling
+            # draft_token_ids = self._sample_from_logits(
+            #     logits, sampling_metadata)
             draft_token_ids_list.append(draft_token_ids)
+
+            # if step_probs is not None:
+            #     draft_probs_list.append(step_probs)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+        # draft_logits = torch.cat(draft_logits_list, dim=0)
+        # draft_hidden_states = torch.cat(stop_hidden_states, dim=0)
+
+        # stop_position = self._batch_find_stop_position(draft_hidden_states, draft_logits)
+
+        # if stop_position is not None:
+        #     if stop_position == 0:
+        #         return torch.empty((batch_size, 0), dtype=torch.int64, device=logits.device), logits
+        #     else:
+        #         draft_token_ids = draft_token_ids[:, :stop_position]
+        #         draft_logits = draft_logits[:, :stop_position]
+
+        return draft_token_ids, None
+
+
+    def _batch_find_stop_position(self, hidden_states_list: torch.Tensor, logits_list: torch.Tensor) -> Optional[int]:
+        should_stop = self.model.should_stop(hidden_states_list, logits_list)
+
+        # if should_stop.dim() > 1:
+        #     should_stop = should_stop.squeeze()
+        # print(f'Debug Helper | should_stop: {should_stop}')
+        # print(f'Debug Helper | should_stop: {should_stop}')
+        stop_indices = torch.nonzero(should_stop, as_tuple=True)[0]
+        # print(f'Debug Helper | stop_indices: {stop_indices}')
+
+        if len(stop_indices) > 0:
+            return stop_indices[0].item()
+        
+        return None
 
     def prepare_next_token_ids_cpu(
             self, sampled_token_ids: list[list[int]],
@@ -1009,3 +1180,5 @@ def compute_probs_and_sample_next_token(
             next_token_ids,
         )
     return next_token_ids, probs
+
+

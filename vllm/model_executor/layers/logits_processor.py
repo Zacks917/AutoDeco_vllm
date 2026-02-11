@@ -4,7 +4,7 @@
 from typing import Optional
 
 import torch
-
+import torch.nn as nn
 from vllm.distributed import (tensor_model_parallel_all_gather,
                               tensor_model_parallel_gather)
 from vllm.model_executor.custom_op import CustomOp
@@ -56,6 +56,7 @@ class LogitsProcessor(CustomOp):
         else:
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, lm_head, embedding_bias)
+
         if logits is not None:
             if self.soft_cap is not None:
                 logits = logits / self.soft_cap

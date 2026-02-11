@@ -11,6 +11,7 @@ import torch
 from vllm.outputs import (CompletionOutput, PoolingOutput,
                           PoolingRequestOutput, RequestOutput)
 from vllm.sampling_params import RequestOutputKind
+from vllm.sequence import RequestMetrics
 from vllm.tracing import (SpanAttributes, SpanKind, Tracer,
                           extract_trace_context)
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -118,6 +119,17 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        # NOTE AUTOMTP: Commented out - Accumulate spec_decoding_info across all steps
+        # self.accumulated_spec_decoding_info: list[dict[str, Any]] = []
+        # Accumulate dropped_token_probs across all steps (merged into single dict)
+        # self.accumulated_dropped_token_probs: dict = {
+        #     'draft_token_id': [],
+        #     'correct_token_id': [],
+        #     'draft_prob_on_eagle3': [],
+        #     'correct_prob_on_eagle3': [],
+        #     'draft_prob_on_base': [],
+        #     'correct_prob_on_base': [],
+        # }
 
         self.stats = RequestStateStats(
             arrival_time=arrival_time) if log_stats else None
@@ -188,6 +200,8 @@ class RequestState:
         finish_reason: Optional[FinishReason],
         stop_reason: Union[int, str, None],
         kv_transfer_params: Optional[dict[str, Any]] = None,
+        mtp_predictions: Optional[list] = None,
+        # dropped_token_probs: Optional[dict] = None,
     ) -> Optional[Union[RequestOutput, PoolingRequestOutput]]:
 
         finished = finish_reason is not None
@@ -201,7 +215,9 @@ class RequestState:
         if pooling_output is not None:
             return self._new_request_output(
                 request_id, [self._new_pooling_output(pooling_output)],
-                finished)
+                finished, kv_transfer_params=kv_transfer_params,
+                mtp_predictions=mtp_predictions)
+                # dropped_token_probs=dropped_token_probs)
 
         output = self._new_completion_output(new_token_ids, finish_reason,
                                              stop_reason)
@@ -215,7 +231,8 @@ class RequestState:
                 return None
 
         return self._new_request_output(request_id, outputs, finished,
-                                        kv_transfer_params)
+                                        kv_transfer_params, mtp_predictions)
+                                        # dropped_token_probs)
 
     def _new_request_output(
         self,
@@ -223,6 +240,8 @@ class RequestState:
         outputs: Union[list[CompletionOutput], list[PoolingOutput]],
         finished: bool,
         kv_transfer_params: Optional[dict[str, Any]] = None,
+        mtp_predictions: Optional[list] = None,
+        # dropped_token_probs: Optional[dict] = None,
     ) -> Union[RequestOutput, PoolingRequestOutput]:
 
         first_output = outputs[0]
@@ -248,6 +267,20 @@ class RequestState:
         if prompt_token_ids is None and self.prompt_embeds is not None:
             prompt_token_ids = [0] * len(self.prompt_embeds)
 
+        # Build RequestMetrics from internal stats if available
+        metrics = None
+        if self.stats is not None:
+            import time
+            current_time = time.time()
+            metrics = RequestMetrics(
+                arrival_time=self.stats.arrival_time,
+                last_token_time=current_time,
+                first_scheduled_time=self.stats.scheduled_ts if self.stats.scheduled_ts > 0 else None,
+                first_token_time=current_time if self.stats.first_token_ts > 0 else None,
+                time_in_queue=self.stats.scheduled_ts - self.stats.queued_ts if self.stats.scheduled_ts > 0 and self.stats.queued_ts > 0 else None,
+                finished_time=current_time if finished else None,
+            )
+
         return RequestOutput(
             request_id=request_id,
             prompt=self.prompt,
@@ -255,8 +288,11 @@ class RequestState:
             prompt_logprobs=prompt_logprobs,
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
+            metrics=metrics,
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            mtp_predictions=mtp_predictions,
+            # dropped_token_probs=dropped_token_probs,
         )
 
     def _new_completion_output(
@@ -281,6 +317,7 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids):]
 
+        # NOTE AUTOMTP: Commented out - Use accumulated spec_decoding_info
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -289,6 +326,7 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None)
+            # spec_decoding_info=list(self.accumulated_spec_decoding_info))  # Create a copy
 
     def _new_pooling_output(
         self,
@@ -425,6 +463,14 @@ class OutputProcessor:
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
+            mtp_predictions = engine_core_output.mtp_predictions
+            # NOTE AUTOMTP: Commented out - Accumulate dropped_token_probs across all steps
+            # Accumulate dropped_token_probs across all steps (merge into single dict)
+            # if engine_core_output.dropped_token_probs:
+            #     for prob_dict in engine_core_output.dropped_token_probs:
+            #         for key in req_state.accumulated_dropped_token_probs:
+            #             if key in prob_dict:
+            #                 req_state.accumulated_dropped_token_probs[key].extend(prob_dict[key])
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
 
@@ -444,9 +490,26 @@ class OutputProcessor:
                     engine_core_output)
 
             # 4) Create and handle RequestOutput objects.
+            # Use accumulated dropped_token_probs (merged dict with all keys extended)
+            # accumulated_probs = req_state.accumulated_dropped_token_probs if any(req_state.accumulated_dropped_token_probs.values()) else None
+            # if request_output := req_state.make_request_output(
+            #         new_token_ids, pooling_output, finish_reason, stop_reason,
+            #         kv_transfer_params, mtp_predictions, accumulated_probs):
+
             if request_output := req_state.make_request_output(
                     new_token_ids, pooling_output, finish_reason, stop_reason,
-                    kv_transfer_params):
+                    kv_transfer_params, mtp_predictions):
+                # NOTE AUTOMTP
+                assert len(request_output.outputs) == 1, "automtp assert"
+                # NOTE AUTOMTP: Commented out - Accumulate spec_decoding_info in RequestState
+                # if engine_core_output.spec_decoding_info:
+                #     req_state.accumulated_spec_decoding_info.extend(
+                #         engine_core_output.spec_decoding_info
+                #     )
+                #     # Update the CompletionOutput with accumulated info
+                #     request_output.outputs[0].spec_decoding_info = list(
+                #         req_state.accumulated_spec_decoding_info
+                #     )  
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)

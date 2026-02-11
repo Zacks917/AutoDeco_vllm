@@ -92,6 +92,16 @@ class KVConnectorOutput:
         return (not self.finished_sending and not self.finished_recving
                 and not self.kv_connector_stats)
 
+from typing import TYPE_CHECKING, NamedTuple, Any, List, Dict, TypedDict
+
+# NOTE AUTOMTP
+class SpeculativeDecodingInfo(TypedDict):
+    # prefix_tokens: List[int]
+    request_id: str
+    prompt_tokens: List[int]
+    output_tokens: List[int]
+    draft_tokens: List[int]
+    sampled_tokens: List[int]
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
@@ -122,11 +132,27 @@ class ModelRunnerOutput:
 
     # [num_reqs, hidden_size]
     pooler_output: list[Optional[torch.Tensor]]
+    
+    # NOTE AUTOMTP: Commented out - keep empty dict for compatibility
+    spec_decoding_info:Optional[Dict[str, SpeculativeDecodingInfo]] = None
 
     kv_connector_output: Optional[KVConnectorOutput] = None
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: Optional[dict[str, int]] = None
+
+    # MTP predictions for dynamic step size (Auto-MTP)
+    # List of accumulated MTP predictions per request (list of lists)
+    # Each inner list contains all historical predictions for that request
+    # Each prediction is a dict with 'mtp_start_idx', 'source_idx', and 'mtp_size'
+    mtp_predictions: Optional[list[list[dict]]] = None
+
+    # Dropped token probability information for rejection sampling analysis
+    # Contains: draft_prob_on_eagle3, correct_prob_on_eagle3, 
+    #           draft_prob_on_base, correct_prob_on_base
+    # dropped_token_probs: Optional[list[dict]] = None
+
+
 
 
 # ModelRunnerOutput wrapper for async scheduling.
@@ -158,4 +184,6 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],
                                               logprobs=None,
                                               prompt_logprobs_dict={},
                                               pooler_output=[],
-                                              num_nans_in_logits=None)
+                                              spec_decoding_info={},  # NOTE AUTOMTP: Keep empty dict for compatibility
+                                              num_nans_in_logits=None,
+                                              mtp_predictions=None)

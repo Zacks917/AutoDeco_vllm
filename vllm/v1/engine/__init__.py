@@ -70,6 +70,8 @@ class EngineCoreRequest(
 
     trace_headers: Optional[Mapping[str, str]] = None
 
+    # NOTE AUTOMTP: Commented out
+    spec_decoding_info: list[dict[str, Any]] = []  # Keep empty list for compatibility
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
@@ -118,7 +120,11 @@ class EngineCoreOutput(
     trace_headers: Optional[Mapping[str, str]] = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
-
+    # MTP predictions for this request (accumulated history)
+    # Each prediction is a dict with 'mtp_start_idx', 'source_idx', and 'mtp_size'
+    mtp_predictions: Optional[list[dict]] = None
+    # NOTE AUTOMTP: Commented out - keep empty list for compatibility
+    spec_decoding_info: list[dict[str, Any]] = []
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

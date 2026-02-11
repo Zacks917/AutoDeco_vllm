@@ -212,7 +212,7 @@ class Scheduler(SchedulerInterface):
 
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
-                              request.num_computed_tokens)
+                              request.num_computed_tokens) # 第一轮是prompt长度
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
@@ -300,7 +300,7 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
-            if request.spec_token_ids:
+            if request.spec_token_ids: # 首轮不会进这个条件
                 num_scheduled_spec_tokens = (num_new_tokens +
                                              request.num_computed_tokens -
                                              request.num_tokens)
@@ -892,12 +892,12 @@ class Scheduler(SchedulerInterface):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[
-                req_index] if sampled_token_ids else []
+                req_index] if sampled_token_ids else [] # 本轮采样的token ids
 
             scheduled_spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
-            if scheduled_spec_token_ids:
-                num_draft_tokens = len(scheduled_spec_token_ids)
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id)) # 本轮规划的spec tokens，格式为list[int],第一轮[0]? check it
+            if scheduled_spec_token_ids: # 进这个条件
+                num_draft_tokens = len(scheduled_spec_token_ids) # 如果[0]返回也是1，check it
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
@@ -910,6 +910,15 @@ class Scheduler(SchedulerInterface):
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted)
+            else:
+                # NOTE: AUTOMTP - If no spec tokens were scheduled in this step,
+                # clear any existing spec_token_ids to prevent them from affecting
+                # the next scheduling step's num_tokens_with_spec calculation.
+                # This is critical when should_stop returns True and no draft tokens
+                # are generated, as stale spec_token_ids would cause incorrect
+                # num_new_tokens calculation in the next schedule() call.
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
 
             stopped = False
             new_logprobs = None
@@ -956,6 +965,32 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            
+            # Get MTP predictions for this request (accumulated history).
+            mtp_predictions_for_req = None
+            if model_runner_output.mtp_predictions:
+                req_id_to_index = model_runner_output.req_id_to_index
+                req_index = req_id_to_index.get(req_id)
+                if req_index is not None and req_index < len(model_runner_output.mtp_predictions):
+                    # Extract accumulated MTP predictions history for this specific request
+                    # mtp_predictions is a list of lists, each inner list contains
+                    # all historical predictions for that request
+                    # Each prediction is a dict with 'mtp_start_idx', 'source_idx', and 'mtp_size'
+                    mtp_pred_history = model_runner_output.mtp_predictions[req_index]
+                    if mtp_pred_history is not None:
+                        # mtp_pred_history is already a list[dict]
+                        mtp_predictions_for_req = mtp_pred_history
+            
+            # NOTE AUTOMTP: Commented out - Get spec_decoding_info for this request.
+            # spec_decoding_info is a dict mapping req_id to SpeculativeDecodingInfo
+            # EngineCoreOutput.spec_decoding_info expects a list[dict[str, Any]]
+            # spec_decoding_info_for_req = []
+            # if model_runner_output.spec_decoding_info:
+            #     spec_decoding_info_dict = model_runner_output.spec_decoding_info.get(req_id)
+            #     if spec_decoding_info_dict is not None:
+            #         # Wrap single dict in a list
+            #         spec_decoding_info_for_req = [spec_decoding_info_dict]
+            
             if new_token_ids or pooler_output is not None \
                 or kv_transfer_params:
 
@@ -973,6 +1008,9 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        mtp_predictions=mtp_predictions_for_req,
+                        # dropped_token_probs=model_runner_output.dropped_token_probs,
+                        spec_decoding_info=[],  # NOTE AUTOMTP: Commented out
                     ))
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
@@ -1066,6 +1104,7 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(
                     request, input_id)
 
+    # NOTE: AUTOMTP - if draft_token_ids is None, we will not call update_draft_token_ids()
     def update_draft_token_ids(
         self,
         draft_token_ids: DraftTokenIds,
@@ -1080,15 +1119,23 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            if not spec_token_ids:
-                # NOTE(woosuk): request.spec_token_ids should be updated.
-                request.spec_token_ids.clear()
-            elif self.structured_output_manager.should_advance(request):
+            if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
-                    spec_token_ids)
+                    spec_token_ids
+                )
             else:
-                request.spec_token_ids = spec_token_ids
+                request.spec_token_ids = spec_token_ids # 这里为空
+
+    def clear_spec_token_ids_for_running_requests(self) -> None:
+        """Clear spec_token_ids for all running requests.
+        
+        This is called when draft tokens cannot be generated (e.g., when should_stop is True)
+        to prevent reusing old draft tokens in the next scheduling step.
+        """
+        for request in self.running:
+            if request.spec_token_ids:
+                request.spec_token_ids = []
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

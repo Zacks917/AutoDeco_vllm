@@ -44,10 +44,17 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
     prompt_embeds: Optional[torch.Tensor] = None
+    
+    # Accumulated MTP predictions history for this request
+    # Each prediction is a dict with 'mtp_start_idx', 'source_idx', and 'mtp_size'
+    mtp_predictions_history: Optional[list[dict]] = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds)
+        # Initialize mtp_predictions_history if not provided
+        if self.mtp_predictions_history is None:
+            self.mtp_predictions_history = []
 
     @property
     def num_tokens(self) -> int:

@@ -1224,15 +1224,24 @@ class OpenAIServingChat(OpenAIServing):
                         content=content,
                     )
 
+                # NOTE AUTOMTP
                 choice_data = ChatCompletionResponseChoice(
                     index=output.index,
                     message=message,
                     logprobs=logprobs,
-                    finish_reason="tool_calls" if
-                    (tool_call_info is not None
-                     and tool_call_info.tools_called) else
-                    output.finish_reason if output.finish_reason else "stop",
+                    finish_reason=(
+                        "tool_calls"
+                        if (tool_call_info is not None and tool_call_info.tools_called)
+                        else output.finish_reason
+                        if output.finish_reason
+                        else "stop"
+                    ),
                     stop_reason=output.stop_reason,
+                    token_ids=(
+                        as_list(output.token_ids) if request.return_token_ids else None
+                    ),
+                    # NOTE AUTOMTP: Commented out
+                    # spec_decoding_info=output.spec_decoding_info
                 )
                 choices.append(choice_data)
                 continue
@@ -1378,6 +1387,8 @@ class OpenAIServingChat(OpenAIServing):
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids)
                            if request.return_token_ids else None),
+                # NOTE AUTOMTP: Commented out
+                # spec_decoding_info=output.spec_decoding_info
             )
 
             choices.append(choice_data)

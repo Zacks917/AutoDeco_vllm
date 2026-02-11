@@ -272,6 +272,9 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            # Allow mtp_stop_head weights to be missing (new module, will use random init)
+            weights_not_loaded = {w for w in weights_not_loaded 
+                                  if not w.startswith("mtp_stop_head.")}
             if weights_not_loaded:
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")

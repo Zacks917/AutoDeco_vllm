@@ -87,7 +87,9 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
 # yapf: enable
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, LogprobsLists, LogprobsTensors,
-                             ModelRunnerOutput, PoolerOutput, SamplerOutput)
+                             ModelRunnerOutput, PoolerOutput,
+                             SamplerOutput,
+                             SpeculativeDecodingInfo,)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -434,6 +436,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Cached outputs.
         self._draft_token_ids: Optional[Union[list[list[int]],
                                               torch.Tensor]] = None
+        self._draft_logits: Optional[torch.Tensor] = None
+        # self._dropped_token_probs_history: list[dict] = []  # Accumulate all dropped token probs
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_model_len, 1),
@@ -599,6 +603,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                mtp_predictions_history=[],
             )
             self.requests[req_id] = req_state
 
@@ -617,9 +622,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
 
+            # Calculate num_new_tokens BEFORE updating req_state.num_computed_tokens
+            # num_new_tokens = number of newly accepted/generated OUTPUT tokens in the previous step
+            # Use max(old_computed, num_prompt_tokens) to exclude prompt tokens from the count
+            prev_computed = max(req_state.num_computed_tokens, req_state.num_prompt_tokens)
+            num_new_tokens = max(0, num_computed_tokens - prev_computed)
+
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
-
+            
             if not is_last_rank:
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
@@ -627,14 +638,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 new_token_ids = req_data.new_token_ids[i]
                 # Add the sampled token(s) from the previous step (if any).
                 # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (num_computed_tokens + len(new_token_ids) -
-                                  req_state.num_tokens)
-                if num_new_tokens == 1:
+                num_tokens_to_add = (num_computed_tokens + len(new_token_ids) -
+                                     req_state.num_tokens)
+                if num_tokens_to_add == 1:
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
-                elif num_new_tokens > 0:
+                elif num_tokens_to_add > 0:
                     req_state.output_token_ids.extend(
-                        new_token_ids[-num_new_tokens:])
+                        new_token_ids[-num_tokens_to_add:])
 
             # Update the block IDs.
             if not resumed_from_preemption:
@@ -679,7 +690,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Add spec_token_ids to token_ids_cpu.
             spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())) # 如果stop head True，这里返回()
+
+
             if spec_token_ids:
                 num_spec_tokens = len(spec_token_ids)
                 start_index = self.input_batch.num_tokens_no_spec[req_index]
@@ -688,12 +701,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     req_index, start_index:end_token_index] = spec_token_ids
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
-
+                
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
             self.input_batch.add_request(request)
-
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
@@ -1095,6 +1107,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
+        # print(f'HELPER_LOG | gpu_model_runner | use_spec_decode: {use_spec_decode}')
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -2079,13 +2092,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
-            output_token_ids = self.rejection_sampler(
+
+
+            # Get draft_probs from cached value (set during propose_draft_token_ids)
+            # draft_logits = self._draft_logits
+            # self._draft_logits = None  # Clear after use
+
+            # draft_logits = draft_logits.squeeze(0)
+            # print(f'HELPER_LOG | gpu_model_runner | draft_logits: {draft_logits.shape}')
+            # print(f'HELPER_LOG | gpu_model_runner | target_logits: {target_logits.shape}')
+            # assert False
+            # draft token verification entrance
+            output_token_ids, prob_output = self.rejection_sampler(
                 spec_decode_metadata,
-                None,  # draft_probs
+                None,
                 target_logits,
                 bonus_token_ids,
                 sampling_metadata,
             )
+            # Accumulate prob_output to history
+            # if prob_output is not None:
+            #     self._dropped_token_probs_history.append(prob_output)
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
@@ -2237,7 +2264,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
-
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
@@ -2255,6 +2281,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
                  max_query_len, ubatch_slices, num_tokens_after_padding
                  ) = self._prepare_inputs(scheduler_output)
+
+            # if spec_decode_metadata is not None:
+            #     print(f"Debug Helper | gpu_model_runner | execute_model | spec_decode_metadata: {spec_decode_metadata.draft_token_ids.tolist()}")
+            # else:
+            #     print(f"Debug Helper | gpu_model_runner | execute_model | spec_decode_metadata is None")
 
             (
                 num_scheduled_tokens,
@@ -2284,6 +2315,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+
+        # hidden states entrance
         with (set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2312,6 +2345,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            # print(f'HELPER_LOG | gpu_model_runner | hidden_states: {hidden_states.shape}')
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -2328,6 +2362,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -2363,9 +2398,55 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 apply_grammar_bitmask(scheduler_output, self.input_batch,
                                       logits, self.device)
 
+        # sample entrance
         with record_function_or_nullcontext("Sample"):
+            # if spec_decode_metadata is None:
+            #     print(f'Debug Helper | gpu_model_runner | spec_decode_metadata is None')
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # print(f'HELPER_LOG | gpu_model_runner | spec_decode_metadata: {spec_decode_metadata.draft_token_ids.tolist()}')
+        # print(f'HELPER_LOG | gpu_model_runner | sampler_output.sampled_token_ids: {sampler_output.sampled_token_ids}')
+
+        current_mtp_predictions = {}
+        if spec_decode_metadata is not None:
+            current_mtp_predictions['draft_tokens'] = spec_decode_metadata.draft_token_ids.tolist()
+        else:
+            current_mtp_predictions['draft_tokens'] = []
+            # print(f"HELPER_LOG | gpu_model_runner | current_mtp_predictions['draft_tokens']")
+        # print(f'HELPER_LOG | gpu_model_runner | current_mtp_predictions: {current_mtp_predictions}')
+        current_mtp_predictions['sampled_tokens'] = sampler_output.sampled_token_ids[0].tolist()
+
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests[req_id]
+            req_state.mtp_predictions_history.append(current_mtp_predictions)
+        
+        # # NOTE AUTOMTP
+        # assert len(self.input_batch.req_ids) == 1
+        # assert len(sampler_output.sampled_token_ids) == 1
+
+        # save runneroutput
+        
+        req_id = self.input_batch.req_ids[0]
+        request = self.requests.get(req_id)
+
+        # NOTE AUTOMTP: Commented out spec_decoding_info
+        # spec_decoding_info: SpeculativeDecodingInfo = SpeculativeDecodingInfo(
+        #     request_id=req_id,
+        #     prompt_tokens=request.prompt_token_ids,
+        #     output_tokens=[int(t) for t in request.output_token_ids],
+        #     draft_tokens=[],
+        #     sampled_tokens=sampler_output.sampled_token_ids[0].tolist()
+        # )
+        # if spec_decode_metadata is not None and is_global_first_rank():
+        #     # 注意，一次只能请求一条数据，不然 req_id 和 spec_decode_metadata 对不上
+        #     draft_token_ids = spec_decode_metadata.draft_token_ids.tolist()
+        #     spec_decoding_info["draft_tokens"] = draft_token_ids
+        #     print(f"HELPER_LOG | execute_model | draft tokens: {spec_decoding_info['draft_tokens']}")
+        # spec_decoding_info = deepcopy(spec_decoding_info)
+
+        self.input_batch.prev_sampled_token_ids = None
+
+        # draft token proposal entrance
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):
@@ -2378,8 +2459,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
-                )
+                ) # 这个位置返回None
 
+                # print(f"Debug Helper | gpu_model_runner | propose_draft_token_ids | draft_token_ids: {self._draft_token_ids}")
         use_padded_batch_for_eagle = self.speculative_config and \
             self.speculative_config.use_eagle() and \
             not self.speculative_config.disable_padded_drafter_batch
@@ -2423,6 +2505,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
 
+        # only last rank
+        # if get_pp_group().is_last_rank:
+        # if mtp_size is not None:
+        mtp_predictions = []
+        for idx, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            mtp_predictions.append(req_state.mtp_predictions_history)
+
+        # Get dropped token probs history and clear
+        # dropped_token_probs = self._dropped_token_probs_history.copy() if self._dropped_token_probs_history else None
+        # self._dropped_token_probs_history.clear()
+
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2430,8 +2524,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
+            spec_decoding_info={}, # NOTE: AUTOMTP - Commented out
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            mtp_predictions=mtp_predictions,
+            # dropped_token_probs=dropped_token_probs,
         )
 
         if not self.use_async_scheduling:
@@ -2444,16 +2541,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             async_output_copy_stream=self.async_output_copy_stream,
         )
 
+
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
-        if self._draft_token_ids is None:
-            return None
         req_ids = self.input_batch.req_ids
+        if self._draft_token_ids is None:
+            return DraftTokenIds(req_ids, [[]])
         if isinstance(self._draft_token_ids, torch.Tensor):
             draft_token_ids = self._draft_token_ids.tolist()
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
-        return DraftTokenIds(req_ids, draft_token_ids)
+        # Auto-MTP: Filter out invalid tokens (-1) from draft_token_ids
+        # Each request may have different number of valid draft tokens
+        filtered_draft_token_ids = [
+            [token_id for token_id in req_tokens if token_id != -1]
+            for req_tokens in draft_token_ids
+        ]
+        return DraftTokenIds(req_ids, filtered_draft_token_ids)
 
     def propose_draft_token_ids(
         self,
@@ -2572,7 +2676,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embeds = self._gather_mm_embeddings(scheduler_output,
                                                        shift_computed_tokens=1)
 
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids, draft_logits = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -2582,6 +2686,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 common_attn_metadata=common_attn_metadata,
                 mm_embeds=mm_embeds,
             )
+            # Store draft_probs for rejection sampling
+            self._draft_logits = draft_logits
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:
