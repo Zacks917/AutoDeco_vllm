@@ -4,6 +4,8 @@
 from collections.abc import Iterable
 from typing import Optional
 from pydantic_core.core_schema import NoneSchema
+import atexit
+import os
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
@@ -229,13 +231,55 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             requires_grad=False,
         )
 
-        self.adapter = AutoMTPStopHead(
+        self.adapter = AutoMTPStopHeadMid(
             hidden_size=self.config.hidden_size,
         )
         # 先创建原始 adapter，等权重加载后再 compile
         # self.adapter = AutoMTPStopHeadSimple(hidden_size=self.config.hidden_size)
         self._adapter_compiled = False  # 标记是否已 compile
         # self.adapter = AutoMTPStopHeadDeep(hidden_size=self.config.hidden_size)
+        self._init_should_stop_profiler()
+
+    def _init_should_stop_profiler(self) -> None:
+        enabled = os.getenv("PROFILE_SHOULD_STOP", "0") in ("1", "true", "True")
+        self._profile_should_stop_enabled = enabled
+        if not enabled:
+            return
+
+        self._profile_log_interval = int(
+            os.getenv("PROFILE_SHOULD_STOP_LOG_INTERVAL", "200"))
+        self._profile_threshold = float(
+            os.getenv("PROFILE_SHOULD_STOP_THRESHOLD", "0.5"))
+
+        self._profile_calls = 0
+        self._profile_stop_true = 0
+        self._profile_ms_total = 0.0
+        self._profile_ms_entropy = 0.0
+        self._profile_ms_cat = 0.0
+        self._profile_ms_adapter = 0.0
+        self._profile_ms_post = 0.0
+
+        atexit.register(self._log_should_stop_profile_summary)
+
+    def _log_should_stop_profile_summary(self) -> None:
+        if not getattr(self, "_profile_should_stop_enabled", False):
+            return
+        calls = getattr(self, "_profile_calls", 0)
+        if calls == 0:
+            logger.info("[should_stop profile] no should_stop calls recorded.")
+            return
+        stop_rate = self._profile_stop_true / calls
+        logger.info(
+            "[should_stop profile][summary] calls=%d stop_rate=%.4f "
+            "avg_total=%.4fms entropy=%.4fms cat=%.4fms adapter=%.4fms post=%.4fms",
+            calls,
+            stop_rate,
+            self._profile_ms_total / calls,
+            self._profile_ms_entropy / calls,
+            self._profile_ms_cat / calls,
+            self._profile_ms_adapter / calls,
+            self._profile_ms_post / calls,
+        )
 
     def forward(
         self,
@@ -256,26 +300,80 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         hidden_states: torch.Tensor,
         logits: torch.Tensor,
     ) -> torch.Tensor:
+        threshold = getattr(self, "_profile_threshold", 0.5)
+
         if self.adapter is None:
             if hidden_states.dim() == 1:
                 return torch.tensor(False, device=hidden_states.device)
             return torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
+
+        profiling_enabled = (
+            getattr(self, "_profile_should_stop_enabled", False)
+            and hidden_states.is_cuda
+            and logits.is_cuda
+        )
+
+        if profiling_enabled:
+            ev_total_start = torch.cuda.Event(enable_timing=True)
+            ev_entropy_start = torch.cuda.Event(enable_timing=True)
+            ev_entropy_end = torch.cuda.Event(enable_timing=True)
+            ev_cat_end = torch.cuda.Event(enable_timing=True)
+            ev_adapter_end = torch.cuda.Event(enable_timing=True)
+            ev_post_end = torch.cuda.Event(enable_timing=True)
+
+            ev_total_start.record()
+            ev_entropy_start.record()
 
         # Compute entropy using torch.special.entr (更高效的 CUDA 实现)
         # entr(p) = -p * log(p)，所以 entropy = sum(entr(p))
         probs = torch.nn.functional.softmax(logits.float(), dim=-1)
         entropy = torch.special.entr(probs).sum(dim=-1, keepdim=True)  # [num_tokens, 1]
         entropy = entropy.to(hidden_states.dtype)
-        
+        if profiling_enabled:
+            ev_entropy_end.record()
+
         # [num_tokens, hidden_size] + [num_tokens, 1] → [num_tokens, hidden_size + 1]
         hidden_states = torch.cat([hidden_states, entropy], dim=-1)
+        if profiling_enabled:
+            ev_cat_end.record()
 
         stop_logits = self.adapter(hidden_states)  # [num_tokens, 1] 或 [1]
+        if profiling_enabled:
+            ev_adapter_end.record()
+
         stop_prob = torch.sigmoid(stop_logits).squeeze(-1)
-        
-        print(f"Debug Helper | stop_prob: {stop_prob}")
-        # 返回布尔 tensor: [num_tokens] 或标量
-        return True if stop_prob >= 0.5 else False
+        stop_mask = stop_prob >= threshold
+
+        if profiling_enabled:
+            ev_post_end.record()
+            ev_post_end.synchronize()
+
+            self._profile_calls += 1
+            self._profile_ms_total += ev_total_start.elapsed_time(ev_post_end)
+            self._profile_ms_entropy += ev_entropy_start.elapsed_time(
+                ev_entropy_end)
+            self._profile_ms_cat += ev_entropy_end.elapsed_time(ev_cat_end)
+            self._profile_ms_adapter += ev_cat_end.elapsed_time(ev_adapter_end)
+            self._profile_ms_post += ev_adapter_end.elapsed_time(ev_post_end)
+            if bool(stop_mask.any().item()):
+                self._profile_stop_true += 1
+
+            if self._profile_calls % self._profile_log_interval == 0:
+                avg_total = self._profile_ms_total / self._profile_calls
+                logger.info(
+                    "[should_stop profile] calls=%d avg_total=%.4fms "
+                    "entropy=%.4fms cat=%.4fms adapter=%.4fms post=%.4fms "
+                    "stop_rate=%.4f",
+                    self._profile_calls,
+                    avg_total,
+                    self._profile_ms_entropy / self._profile_calls,
+                    self._profile_ms_cat / self._profile_calls,
+                    self._profile_ms_adapter / self._profile_calls,
+                    self._profile_ms_post / self._profile_calls,
+                    self._profile_stop_true / self._profile_calls,
+                )
+
+        return stop_mask
 
     def compute_logits(
         self,

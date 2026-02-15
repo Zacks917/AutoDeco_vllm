@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import atexit
 from dataclasses import replace
 from importlib.util import find_spec
 from typing import Optional
+import os
 
 import numpy as np
 import torch
@@ -39,6 +41,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
+SHOULD_STOP_COMPUTE_ONLY_VALUES = ("1", "true", "True")
 
 
 class EagleProposer:
@@ -156,6 +159,179 @@ class EagleProposer:
 
         # Sampling epsilon for temperature check
         self._SAMPLING_EPS = 1e-5
+        self._init_global_profile()
+
+    def _init_global_profile(self) -> None:
+        self._profile_global_enabled = os.getenv(
+            "PROFILE_EAGLE_GLOBAL", "0") in ("1", "true", "True")
+        if not self._profile_global_enabled:
+            return
+
+        self._profile_global_log_interval = int(
+            os.getenv("PROFILE_EAGLE_LOG_INTERVAL", "500"))
+        self._profile_propose_calls = 0
+        self._profile_total_batch_size = 0
+        self._profile_total_loop_iters = 0
+        self._profile_total_draft_tokens = 0
+
+        self._profile_stop_calls = 0
+        self._profile_stop_calls_initial = 0
+        self._profile_stop_calls_loop = 0
+        self._profile_stop_pred_true = 0
+        self._profile_stop_applied_true = 0
+        self._profile_stop_compute_only_overrides = 0
+        self._profile_stop_ms_total = 0.0
+        self._profile_stop_ms_initial = 0.0
+        self._profile_stop_ms_loop = 0.0
+
+        atexit.register(self._log_global_profile_summary)
+
+    def _to_python_bool(self, value: bool | torch.Tensor) -> bool:
+        if isinstance(value, bool):
+            return value
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return bool(value.item())
+            return bool(value.any().item())
+        return bool(value)
+
+    def _to_batch_stop_mask(
+        self,
+        value: bool | torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(value, bool):
+            return torch.full((batch_size, ),
+                              value,
+                              dtype=torch.bool,
+                              device=device)
+        if torch.is_tensor(value):
+            if value.dtype != torch.bool:
+                value = value.to(dtype=torch.bool)
+            if value.numel() == 1:
+                return value.view(1).expand(batch_size)
+            value = value.view(-1)
+            if value.numel() != batch_size:
+                raise RuntimeError(
+                    f"Unexpected should_stop shape: got {value.shape}, "
+                    f"expected batch_size={batch_size}")
+            return value
+        return torch.full((batch_size, ),
+                          bool(value),
+                          dtype=torch.bool,
+                          device=device)
+
+    def _evaluate_should_stop(
+        self,
+        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+        stage: str,
+    ) -> torch.Tensor:
+        batch_size = hidden_states.shape[0] if hidden_states.dim() > 1 else 1
+        device = hidden_states.device
+        if os.getenv("DISABLE_SHOULD_STOP", "0") in ("1", "true", "True"):
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        profile_enabled = (
+            self._profile_global_enabled
+            and hidden_states.is_cuda
+            and logits.is_cuda
+        )
+        if profile_enabled:
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+
+        raw_should_stop = self.model.should_stop(hidden_states, logits)
+
+        if profile_enabled:
+            ev_end.record()
+            ev_end.synchronize()
+            elapsed_ms = ev_start.elapsed_time(ev_end)
+            self._profile_stop_ms_total += elapsed_ms
+            if stage == "initial":
+                self._profile_stop_ms_initial += elapsed_ms
+            else:
+                self._profile_stop_ms_loop += elapsed_ms
+
+        pred_mask = self._to_batch_stop_mask(raw_should_stop, batch_size, device)
+        pred_true = bool(pred_mask.any().item())
+        if self._profile_global_enabled:
+            self._profile_stop_calls += 1
+            if stage == "initial":
+                self._profile_stop_calls_initial += 1
+            else:
+                self._profile_stop_calls_loop += 1
+            if pred_true:
+                self._profile_stop_pred_true += 1
+
+        compute_only = (
+            os.getenv("SHOULD_STOP_COMPUTE_ONLY", "0")
+            in SHOULD_STOP_COMPUTE_ONLY_VALUES
+        )
+        applied_stop_mask = (torch.zeros_like(pred_mask)
+                             if compute_only else pred_mask)
+
+        # Optional simulation mode: synchronize stop decision across the batch.
+        # If any request should stop, stop all requests together.
+        if (not compute_only and batch_size > 1 and
+                os.getenv("SYNC_SHOULD_STOP_IN_BATCH", "0")
+                in SHOULD_STOP_COMPUTE_ONLY_VALUES):
+            batch_stop = applied_stop_mask.any()
+            applied_stop_mask = batch_stop.view(1).expand_as(applied_stop_mask)
+        applied_should_stop = bool(applied_stop_mask.any().item())
+        if self._profile_global_enabled:
+            if compute_only and pred_true:
+                self._profile_stop_compute_only_overrides += 1
+            if applied_should_stop:
+                self._profile_stop_applied_true += 1
+            if self._profile_stop_calls % self._profile_global_log_interval == 0:
+                avg_ms = self._profile_stop_ms_total / self._profile_stop_calls
+                logger.info(
+                    "[eagle global profile] stop_calls=%d avg_stop_ms=%.4f "
+                    "pred_true_rate=%.4f applied_true_rate=%.4f "
+                    "compute_only_overrides=%d",
+                    self._profile_stop_calls,
+                    avg_ms,
+                    self._profile_stop_pred_true / self._profile_stop_calls,
+                    self._profile_stop_applied_true / self._profile_stop_calls,
+                    self._profile_stop_compute_only_overrides,
+                )
+        return applied_stop_mask
+
+    def _log_global_profile_summary(self) -> None:
+        if not self._profile_global_enabled:
+            return
+
+        stop_calls = self._profile_stop_calls
+        propose_calls = self._profile_propose_calls
+        logger.info(
+            "[eagle global profile][summary] propose_calls=%d total_batch=%d "
+            "avg_batch=%.3f total_loop_iters=%d avg_loop_iters=%.3f "
+            "total_draft_tokens=%d avg_draft_tokens=%.3f",
+            propose_calls,
+            self._profile_total_batch_size,
+            self._profile_total_batch_size / max(propose_calls, 1),
+            self._profile_total_loop_iters,
+            self._profile_total_loop_iters / max(propose_calls, 1),
+            self._profile_total_draft_tokens,
+            self._profile_total_draft_tokens / max(propose_calls, 1),
+        )
+        logger.info(
+            "[eagle global profile][summary] stop_calls=%d initial=%d loop=%d "
+            "pred_true=%d applied_true=%d compute_only_overrides=%d "
+            "avg_stop_ms=%.4f avg_stop_ms_initial=%.4f avg_stop_ms_loop=%.4f",
+            stop_calls,
+            self._profile_stop_calls_initial,
+            self._profile_stop_calls_loop,
+            self._profile_stop_pred_true,
+            self._profile_stop_applied_true,
+            self._profile_stop_compute_only_overrides,
+            self._profile_stop_ms_total / max(stop_calls, 1),
+            self._profile_stop_ms_initial / max(self._profile_stop_calls_initial, 1),
+            self._profile_stop_ms_loop / max(self._profile_stop_calls_loop, 1),
+        )
 
     def _sample_from_logits(
         self,
@@ -235,6 +411,11 @@ class EagleProposer:
         """
         num_tokens = target_token_ids.shape[0] # flatten tensor，all tokens in the batch are concatenated
         batch_size = next_token_ids.shape[0] # request num
+        profile_loop_iters = 0
+
+        if self._profile_global_enabled:
+            self._profile_propose_calls += 1
+            self._profile_total_batch_size += int(batch_size)
 
 
         if last_token_indices is None:
@@ -334,23 +515,29 @@ class EagleProposer:
 
         # NOTE: AUTOMTP
         # should_stop = None
-
+        
         if self.num_speculative_tokens == 1:
-            # greedy 
+            # greedy
             draft_token_ids = logits.argmax(dim=-1)
+            should_stop_mask = self._evaluate_should_stop(
+                sample_hidden_states, logits, stage="initial")
+            valid_mask = ~should_stop_mask
 
-            # sampling
-            # draft_token_ids = self._sample_from_logits(
-            #     logits, sampling_metadata)
-            # print(f'Debug Helper | sampling_metadata: {sampling_metadata}')
-            # assert False
-
-            should_stop = self.model.should_stop(sample_hidden_states, logits)
-            
-            if should_stop:
-                # print(f'Debug Helper | should_stop is True')
+            if not bool(valid_mask.any().item()):
+                if self._profile_global_enabled:
+                    self._profile_total_loop_iters += profile_loop_iters
                 return None, logits
-            return draft_token_ids.view(-1, 1), logits
+
+            draft_out = torch.full((batch_size, 1),
+                                   -1,
+                                   dtype=draft_token_ids.dtype,
+                                   device=draft_token_ids.device)
+            draft_out[:, 0] = torch.where(valid_mask, draft_token_ids,
+                                          draft_out[:, 0])
+            if self._profile_global_enabled:
+                self._profile_total_loop_iters += profile_loop_iters
+                self._profile_total_draft_tokens += int(valid_mask.sum().item())
+            return draft_out, logits
 
         positions = target_positions[last_token_indices]
         if self.method in ("deepseek_mtp", "ernie_mtp", "longcat_flash_mtp"):
@@ -370,9 +557,14 @@ class EagleProposer:
             # [batch_size, num_tree_tokens]
             # NOTE: Tree attention does not return draft_probs for now
             return torch.cat(draft_token_ids_list, dim=1), None
-
-        should_stop = self.model.should_stop(sample_hidden_states, logits)
-        if should_stop:
+        
+        # NOTE: AUTOMTP toggle via env `DISABLE_SHOULD_STOP`
+        should_stop_mask = self._evaluate_should_stop(
+            sample_hidden_states, logits, stage="initial")
+        active_mask = ~should_stop_mask
+        if not bool(active_mask.any().item()):
+            if self._profile_global_enabled:
+                self._profile_total_loop_iters += profile_loop_iters
             return None, logits
 
         # greedy
@@ -398,27 +590,35 @@ class EagleProposer:
                 f"{type(attn_metadata)}. Supported types are: "
                 f"{self.allowed_attn_types}")
 
-        # Generate the remaining draft tokens.
-        draft_token_ids_list = [draft_token_ids]
+        # Generate draft tokens with per-request stop mask.
+        draft_token_ids = draft_token_ids.int()
+        draft_tokens_out = torch.full(
+            (batch_size, self.num_speculative_tokens),
+            -1,
+            dtype=draft_token_ids.dtype,
+            device=draft_token_ids.device,
+        )
+        draft_tokens_out[:, 0] = torch.where(active_mask, draft_token_ids,
+                                             draft_tokens_out[:, 0])
+        current_input_ids = torch.where(active_mask, draft_token_ids,
+                                        torch.zeros_like(draft_token_ids))
 
-        if self.use_cuda_graph and \
-                batch_size <= self.cudagraph_batch_sizes[-1]:
-            input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
-        else:
-            input_batch_size = batch_size
-
-
-        common_attn_metadata.num_actual_tokens = batch_size
-        common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[:batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-            self.token_arange_np[:batch_size + 1]).clone()
+        # Keep a mutable full-batch seq_len state, while running compact
+        # per-step active sub-batches for better GPU utilization.
+        full_seq_lens = common_attn_metadata.seq_lens.clone()
+        full_seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
+        full_block_table = common_attn_metadata.block_table_tensor
         for token_index in range(self.num_speculative_tokens - 1):
-            # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
-            positions += 1
+            if not bool(active_mask.any().item()):
+                break
+            profile_loop_iters += 1
+            active_indices = torch.nonzero(active_mask, as_tuple=True)[0]
+            if active_indices.numel() == 0:
+                break
+            active_count = int(active_indices.numel())
+
+            # Advance only active requests.
+            positions[active_indices] += 1
 
             # NOTE(woosuk): We should handle the case where the draft model
             # generates tokens beyond the max model length. Since it is complex
@@ -426,51 +626,72 @@ class EagleProposer:
             # but adjust the position ids and slot mappings to avoid the
             # out-of-range access during the model execution. The draft tokens
             # generated with this adjustment should be ignored.
-            exceeds_max_model_len = positions >= self.max_model_len
-            # Mask out the position ids that exceed the max model length.
-            # Otherwise, we may get out-of-range error in RoPE.
-            clamped_positions = torch.where(exceeds_max_model_len, 0,
-                                            positions)
+            active_positions = positions[active_indices]
+            step_valid_mask = active_positions < self.max_model_len
+            if not bool(step_valid_mask.any().item()):
+                active_mask = torch.zeros_like(active_mask)
+                break
+            valid_indices = active_indices[step_valid_mask]
+            valid_count = int(valid_indices.numel())
 
-            # Increment the sequence lengths.
-            common_attn_metadata.seq_lens += 1
-            common_attn_metadata.seq_lens_cpu += 1
-            # For the requests that exceed the max model length, we set the
-            # sequence length to 1 to minimize their overheads in attention.
-            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len,
-                                                       1)
+            # Increment sequence lengths for valid active requests only.
+            full_seq_lens[valid_indices] += 1
+            valid_indices_cpu = valid_indices.to(device="cpu")
+            full_seq_lens_cpu[valid_indices_cpu] += 1
 
-            common_attn_metadata.num_computed_tokens_cpu = \
-                common_attn_metadata.seq_lens_cpu - 1
+            # Build compact common attention metadata for this active sub-batch.
+            step_query_start_loc = self.arange[:valid_count + 1]
+            step_query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[:valid_count + 1]).clone()
+            step_seq_lens = full_seq_lens[valid_indices]
+            step_seq_lens_cpu = full_seq_lens_cpu[valid_indices_cpu]
+            step_num_computed_tokens_cpu = step_seq_lens_cpu - 1
+            step_positions = positions[valid_indices]
+            step_block_table = full_block_table.index_select(0, valid_indices)
+            step_block_numbers = step_positions // self.block_size
+            step_block_ids = step_block_table.gather(
+                dim=1, index=step_block_numbers.view(-1, 1)).view(-1)
+            step_slot_mapping = (
+                step_block_ids * self.block_size +
+                step_positions % self.block_size)
+            step_common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=step_query_start_loc,
+                query_start_loc_cpu=step_query_start_loc_cpu,
+                seq_lens=step_seq_lens,
+                seq_lens_cpu=step_seq_lens_cpu,
+                num_computed_tokens_cpu=step_num_computed_tokens_cpu,
+                num_reqs=valid_count,
+                num_actual_tokens=valid_count,
+                max_query_len=1,
+                max_seq_len=int(step_seq_lens_cpu.max().item()),
+                block_table_tensor=step_block_table,
+                slot_mapping=step_slot_mapping,
+                causal=True,
+            )
 
-            # Compute the slot mapping.
-            block_numbers = clamped_positions // self.block_size
-            block_ids = common_attn_metadata.block_table_tensor.gather(
-                dim=1, index=block_numbers.view(-1, 1))
-            block_ids = block_ids.view(-1)
-            common_attn_metadata.slot_mapping = (
-                block_ids * self.block_size +
-                clamped_positions % self.block_size)
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
-            common_attn_metadata.slot_mapping.masked_fill_(
-                exceeds_max_model_len, PADDING_SLOT_ID)
-
-            # Rebuild attention metadata
+            # Rebuild attention metadata for compact active sub-batch.
             attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=step_common_attn_metadata,
                 draft_index=token_index + 1)
             for layer_name in self.attn_layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
-            # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.positions[:batch_size] = clamped_positions
-            self.hidden_states[:batch_size] = hidden_states
+            if self.use_cuda_graph and \
+                    valid_count <= self.cudagraph_batch_sizes[-1]:
+                input_batch_size = self.vllm_config.pad_for_cudagraph(
+                    valid_count)
+            else:
+                input_batch_size = valid_count
+
+            # Copy compact active inputs to buffer for cudagraph.
+            input_ids = current_input_ids.index_select(0, valid_indices)
+            self.input_ids[:valid_count] = input_ids
+            self.positions[:valid_count] = step_positions
+            self.hidden_states[:valid_count] = hidden_states.index_select(
+                0, valid_indices)
             if self.is_multimodal_model:
                 inputs_embeds = self.model.get_input_embeddings(input_ids)
-                self.inputs_embeds[:batch_size] = inputs_embeds
+                self.inputs_embeds[:valid_count] = inputs_embeds
                 inputs_embeds = self.inputs_embeds[:input_batch_size]
                 input_ids = None
             else:
@@ -488,15 +709,18 @@ class EagleProposer:
                     inputs_embeds=inputs_embeds,
                 )
                 if self.method == "mtp":
-                    last_hidden_states = ret_hidden_states
-                    hidden_states = ret_hidden_states
+                    last_hidden_states_active = ret_hidden_states[:valid_count]
+                    hidden_states_active = ret_hidden_states[:valid_count]
                 else:
-                    last_hidden_states, hidden_states = ret_hidden_states
-            hidden_states = hidden_states[:batch_size]
+                    last_hidden_states_active, hidden_states_active = \
+                        ret_hidden_states
+                    last_hidden_states_active = last_hidden_states_active[
+                        :valid_count]
+                    hidden_states_active = hidden_states_active[:valid_count]
 
-
-
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
+            # Scatter compact outputs back to full-batch state in-place.
+            hidden_states[valid_indices] = hidden_states_active
+            logits_active = self.model.compute_logits(last_hidden_states_active)
             # draft_token_ids = logits.argmax(dim=-1)
             # Use sampling instead of argmax
             # draft_token_ids, step_probs = self._sample_from_logits(
@@ -509,22 +733,36 @@ class EagleProposer:
             # stop_hidden_states.append(last_hidden_states[:batch_size])
             # draft_logits_list.append(logits)
             
-            should_stop = self.model.should_stop(last_hidden_states[:batch_size], logits)
-            
-            if should_stop:
-                break
+            # NOTE: AUTOMTP toggle via env `DISABLE_SHOULD_STOP`
+            should_stop_mask_active = self._evaluate_should_stop(
+                last_hidden_states_active, logits_active, stage="loop")
+            keep_active_mask = ~should_stop_mask_active
+            next_indices = valid_indices[keep_active_mask]
             # greedy
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids_active = logits_active.argmax(dim=-1).int()
             # sampling
             # draft_token_ids = self._sample_from_logits(
             #     logits, sampling_metadata)
-            draft_token_ids_list.append(draft_token_ids)
+            if next_indices.numel() > 0:
+                draft_tokens_out[next_indices, token_index + 1] = \
+                    draft_token_ids_active[keep_active_mask]
+            current_input_ids.zero_()
+            if next_indices.numel() > 0:
+                current_input_ids[next_indices] = draft_token_ids_active[
+                    keep_active_mask]
+            active_mask = torch.zeros_like(active_mask)
+            if next_indices.numel() > 0:
+                active_mask[next_indices] = True
 
             # if step_probs is not None:
             #     draft_probs_list.append(step_probs)
 
-        # [batch_size, num_speculative_tokens]
-        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        # [batch_size, num_speculative_tokens], with -1 as per-request padding
+        draft_token_ids = draft_tokens_out
+        if self._profile_global_enabled:
+            self._profile_total_loop_iters += profile_loop_iters
+            self._profile_total_draft_tokens += int(
+                (draft_token_ids != -1).sum().item())
         # draft_logits = torch.cat(draft_logits_list, dim=0)
         # draft_hidden_states = torch.cat(stop_hidden_states, dim=0)
 
@@ -541,7 +779,11 @@ class EagleProposer:
 
 
     def _batch_find_stop_position(self, hidden_states_list: torch.Tensor, logits_list: torch.Tensor) -> Optional[int]:
-        should_stop = self.model.should_stop(hidden_states_list, logits_list)
+        # NOTE: AUTOMTP toggle via env `DISABLE_SHOULD_STOP`
+        if os.getenv("DISABLE_SHOULD_STOP", "0") in ("1", "true", "True"):
+            should_stop = torch.zeros(hidden_states_list.shape[0], dtype=torch.bool, device=hidden_states_list.device)
+        else:
+            should_stop = self.model.should_stop(hidden_states_list, logits_list)
 
         # if should_stop.dim() > 1:
         #     should_stop = should_stop.squeeze()
